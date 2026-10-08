@@ -1,3 +1,4 @@
+import re
 from typing import Dict, List, Optional, Set, Tuple, cast
 
 from fastapi import HTTPException
@@ -12,6 +13,7 @@ from litellm.proxy._types import (
     SpecialHeaders,
     UserAPIKeyAuth,
 )
+from litellm.proxy.auth.ip_address_utils import IPAddressUtils
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 
 
@@ -117,7 +119,10 @@ class MCPRequestHandler:
             return b"{}"
 
         request.body = mock_body  # type: ignore
-        if ".well-known" in str(request.url):  # public routes
+        # Only OAuth metadata routes registered under /.well-known/ are public.
+        # Match on request.url.path (path-only, exact prefix) so the substring
+        # cannot be smuggled via query string, hostname, or a deeper URL segment.
+        if request.url.path.startswith("/.well-known/"):
             validated_user_api_key_auth = UserAPIKeyAuth()
         elif has_explicit_litellm_key:
             # Explicit x-litellm-api-key provided - always validate normally
@@ -126,27 +131,42 @@ class MCPRequestHandler:
             )
         elif oauth2_headers:
             # No x-litellm-api-key, but Authorization header present.
-            # Could be a LiteLLM key (backward compat) OR an OAuth2 token
-            # from an upstream MCP provider (e.g. Atlassian).
-            # Try LiteLLM auth first; on auth failure, treat as OAuth2 passthrough.
+            # Could be a LiteLLM key (backward compat) OR an opaque OAuth2 token
+            # the operator wants forwarded to an upstream OAuth2-mode MCP server.
+            # Try LiteLLM auth first; on auth failure, only fall back to anonymous
+            # passthrough when the request actually targets a server whose operator
+            # configured ``auth_type=oauth2``. For any other server (api_key,
+            # bearer_token, basic, etc.), a failed LiteLLM auth is a real failure
+            # and must propagate — otherwise an attacker can exchange any garbage
+            # bearer for an anonymous session.
             try:
                 validated_user_api_key_auth = await user_api_key_auth(
                     api_key=litellm_api_key, request=request
                 )
-            except HTTPException as e:
-                if e.status_code in (401, 403):
+            except (HTTPException, ProxyException) as e:
+                # HTTPException.status_code is int; ProxyException.code is
+                # normalized to str in its __init__ but can be ``"None"`` or any
+                # non-numeric string when the caller didn't supply a numeric
+                # code, so we compare against both int and str forms rather
+                # than coercing (``int("None")`` would raise ValueError and
+                # rewrite the auth error as a 500).
+                status = e.status_code if isinstance(e, HTTPException) else e.code
+                # Resolve targets from the raw ASGI path and the caller's MCP
+                # client IP — the same inputs downstream routing
+                # (server.py::handle_streamable_http_mcp / handle_sse_mcp) uses.
+                if status in (
+                    401,
+                    403,
+                    "401",
+                    "403",
+                ) and MCPRequestHandler._target_servers_use_oauth2(
+                    path=scope.get("path", ""),
+                    mcp_servers=mcp_servers,
+                    client_ip=IPAddressUtils.get_mcp_client_ip(request),
+                ):
                     verbose_logger.debug(
-                        "MCP OAuth2: Authorization header is not a valid LiteLLM key, "
-                        "treating as OAuth2 token passthrough"
-                    )
-                    validated_user_api_key_auth = UserAPIKeyAuth()
-                else:
-                    raise
-            except ProxyException as e:
-                if str(e.code) in ("401", "403"):
-                    verbose_logger.debug(
-                        "MCP OAuth2: Authorization header is not a valid LiteLLM key, "
-                        "treating as OAuth2 token passthrough"
+                        "MCP OAuth2: target server is OAuth2-mode, treating "
+                        "Authorization as upstream OAuth2 token passthrough"
                     )
                     validated_user_api_key_auth = UserAPIKeyAuth()
                 else:
@@ -164,6 +184,109 @@ class MCPRequestHandler:
             oauth2_headers,
             dict(headers),
         )
+
+    @staticmethod
+    def _extract_target_server_names_from_path(path: str) -> Optional[List[str]]:
+        """
+        Extract the target MCP server name(s) from the ``/mcp/{servers}[/...]``
+        transport URL pattern. ``/{server_name}/mcp`` requests are rewritten to
+        ``/mcp/{server_name}`` by ``dynamic_mcp_route`` before they reach the
+        MCP handler.
+
+        Mirrors the parser in ``server.py::_get_mcp_servers_in_path`` so the
+        names used for auth gating match the names used for downstream
+        routing: the server part may be a comma-separated list, and a single
+        server name may contain one slash (e.g. ``custom_solutions/user_123``).
+        Without this alignment an attacker could craft
+        ``/mcp/<oauth2_server>/<garbage>`` so that auth treats the request as
+        targeting the OAuth2 server while routing sees a different
+        (non-existent) target and falls back to every server the session can
+        reach.
+
+        Returns ``None`` when the path does not encode targets (routing then
+        uses the ``x-mcp-servers`` header), otherwise the parsed list — which
+        may be empty, in which case callers fail closed.
+
+        REST/admin endpoints, OAuth2 server endpoints
+        (``/{server_name}/authorize``, ``/token`` etc.), and ``.well-known``
+        discovery routes intentionally fall through — those flows do not need
+        OAuth2 token passthrough. Clients aggregating multiple servers should
+        use ``x-mcp-servers`` on a path that does not encode a target.
+        """
+        mcp_path_match = re.match(r"^/mcp/([^?#]+)(?:\?.*)?(?:#.*)?$", path)
+        if not mcp_path_match:
+            return None
+        servers_and_path = mcp_path_match.group(1)
+        if not servers_and_path:
+            return None
+
+        if "," in servers_and_path:
+            # Comma-separated servers, possibly followed by a trailing path.
+            path_match = re.search(r"/([^/,]+(?:/[^/,]+)*)$", servers_and_path)
+            if path_match:
+                servers_part = servers_and_path[: -(len(path_match.group(1)) + 1)]
+            else:
+                servers_part = servers_and_path
+            return [s.strip() for s in servers_part.split(",") if s.strip()]
+
+        # Single-server case — server name may contain at most one slash.
+        single_server_match = re.match(
+            r"^([^/]+(?:/[^/]+)?)(?:/.*)?$", servers_and_path
+        )
+        if single_server_match:
+            return [single_server_match.group(1)]
+        return [servers_and_path]
+
+    @staticmethod
+    def _target_servers_use_oauth2(
+        path: str,
+        mcp_servers: Optional[List[str]],
+        client_ip: Optional[str] = None,
+    ) -> bool:
+        """
+        True only when EVERY MCP server the request targets is configured for
+        ``auth_type == oauth2``. If any target is non-OAuth2 — or if the target
+        cannot be resolved at all — return False so the caller fails closed.
+
+        Used to gate the "treat Authorization as opaque OAuth2 token" fallback
+        in :meth:`process_mcp_request` so a failed LiteLLM-auth cannot be
+        exchanged for an anonymous session against a non-OAuth2 server.
+
+        Targets are resolved exactly as downstream routing resolves them
+        (``server.py::extract_mcp_auth_context``): names encoded in an
+        ``/mcp/...`` path override the ``x-mcp-servers`` header, so a
+        permissive header value cannot flip this gate while the path targets
+        a stricter server. Each target must also be reachable by the resulting
+        anonymous session: visible from the caller's IP and opted into
+        ``allow_all_keys`` (a session without a LiteLLM key is only ever
+        granted ``allow_all_keys`` servers). Otherwise routing cannot match the
+        target and falls back to every ``allow_all_keys`` server, exposing
+        non-OAuth2 servers to the anonymous session.
+        """
+        # Inline imports avoid a circular dependency: mcp_server_manager imports
+        # from this module.
+        from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
+            global_mcp_server_manager,
+        )
+        from litellm.types.mcp import MCPAuth
+
+        # Path-encoded targets win, as in downstream routing. Otherwise use the
+        # x-mcp-servers header verbatim (including the explicitly-empty list,
+        # which means "no targets" → fail closed).
+        path_targets = MCPRequestHandler._extract_target_server_names_from_path(path)
+        target_names = path_targets if path_targets is not None else mcp_servers
+        if not target_names:
+            return False
+
+        for name in target_names:
+            server = global_mcp_server_manager.get_mcp_server_by_name(
+                name, client_ip=client_ip
+            )
+            if server is None or server.auth_type != MCPAuth.oauth2:
+                return False
+            if not server.allow_all_keys:
+                return False
+        return True
 
     @staticmethod
     def _get_mcp_auth_header_from_headers(headers: Headers) -> Optional[str]:
