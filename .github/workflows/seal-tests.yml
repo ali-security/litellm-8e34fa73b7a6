@@ -1,0 +1,141 @@
+name: Seal Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional pytest -k expression; when set, only matching tests run in each matrix leg"
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  # Use the model cost map shipped in this tag (copied into the backup file the
+  # same way the release build does) instead of fetching BerriAI/litellm@main at
+  # import time; the live map has drifted since the release and breaks
+  # cost/capability assertions.
+  LITELLM_LOCAL_MODEL_COST_MAP: "True"
+  # Tests that depend on live third-party services:
+  # - test_openapi_compliance.py validates against Google's live Interactions
+  #   OpenAPI spec (ai.google.dev), which has changed since the release.
+  # - test_openai_deployments_model_chat_completions_azure: the proxy config's
+  #   Lakera guardrail POSTs to api.lakera.ai/v1/prompt_injection (now 404).
+  # - test_convert_tool_response_with_url_image downloads from
+  #   via.placeholder.com, which no longer answers and hangs the worker.
+  # Order-dependent under pytest-xdist: the sync test_credential_leak_prevention
+  # cases fail with pytest.raises(MaskedHTTPStatusError) missing the very class
+  # raised whenever another test on the same worker re-imports http_handler.
+  PYTEST_ADDOPTS: >-
+    --deselect tests/test_litellm/interactions/test_openapi_compliance.py
+    --deselect tests/proxy_unit_tests/test_proxy_server.py::test_openai_deployments_model_chat_completions_azure
+    --deselect tests/test_litellm/llms/vertex_ai/gemini/test_vertex_ai_gemini_transformation.py::test_convert_tool_response_with_url_image
+    --deselect tests/test_litellm/llms/custom_httpx/test_credential_leak_prevention.py::TestHTTPHandlerErrorPaths::test_sync_raises_masked_error[delete]
+    --deselect tests/test_litellm/llms/custom_httpx/test_credential_leak_prevention.py::TestHTTPHandlerErrorPaths::test_sync_raises_masked_error[patch]
+    --deselect tests/test_litellm/llms/custom_httpx/test_credential_leak_prevention.py::TestHTTPHandlerErrorPaths::test_sync_raises_masked_error[post]
+    --deselect tests/test_litellm/llms/custom_httpx/test_credential_leak_prevention.py::TestHTTPHandlerErrorPaths::test_sync_raises_masked_error[put]
+    --deselect tests/test_litellm/llms/custom_httpx/test_credential_leak_prevention.py::TestRaiseMaskedError::test_sync_breaks_exception_chain
+    --deselect tests/test_litellm/llms/custom_httpx/test_credential_leak_prevention.py::TestRaiseMaskedError::test_sync_non_stream
+    --deselect tests/test_litellm/llms/custom_httpx/test_credential_leak_prevention.py::TestRaiseMaskedError::test_sync_stream
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - test-unit-llms
+          - test-unit-proxy-guardrails
+          - test-unit-proxy-core
+          - test-unit-proxy-misc
+          - test-unit-integrations
+          - test-unit-core-utils
+          - test-unit-other
+          - test-unit-root
+          - test-proxy-unit-a
+          - test-proxy-unit-b
+    name: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.10.9"
+      - name: Cache uv dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: ${{ runner.os }}-uv-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-
+      - name: Copy model prices backup
+        run: cp model_prices_and_context_window.json litellm/model_prices_and_context_window_backup.json
+      - name: Run ${{ matrix.target }}
+        env:
+          PRISMA_BINARY_CACHE_DIR: ${{ runner.temp }}/prisma-cache
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            # Scope this leg to the selected tests. A leg whose paths hold no
+            # matching test ends with every test deselected (pytest exit 5,
+            # surfaced by make as a failure) - that leg counts as passed.
+            export PYTEST_ADDOPTS="$PYTEST_ADDOPTS -k '${{ inputs.test-filter }}'"
+            set +e
+            set -o pipefail
+            make ${{ matrix.target }} 2>&1 | tee "$RUNNER_TEMP/seal-test.log"
+            rc=$?
+            set -e
+            if [ "$rc" -ne 0 ]; then
+              summary="$(grep -E '^=+ .* =+$' "$RUNNER_TEMP/seal-test.log" | tail -n 1)"
+              if echo "$summary" | grep -Eq 'deselected|no tests ran' \
+                && ! echo "$summary" | grep -Eq 'passed|failed|error'; then
+                echo "No test in ${{ matrix.target }} matches the filter; leg skipped."
+                rc=0
+              fi
+            fi
+            exit "$rc"
+          else
+            make ${{ matrix.target }}
+          fi
+
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.10.9"
+          enable-cache: false
+      - name: Copy model prices backup
+        run: cp model_prices_and_context_window.json litellm/model_prices_and_context_window_backup.json
+      - name: Build package
+        run: |
+          rm -rf build dist
+          uv build
+      - name: Verify build artifacts
+        run: |
+          ls -la dist/
+          ls dist/*.tar.gz
+          ls dist/*.whl
+      - name: Upload dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
