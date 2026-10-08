@@ -336,7 +336,7 @@ class HuggingFaceEmbeddingConfig(BaseConfig):
 
         Do not add the chat/embedding/rerank extension here. Let the handler do this.
         """
-        if "https" in model:
+        if model.startswith(("http://", "https://")):
             completion_url = model
         elif api_base is not None:
             completion_url = api_base

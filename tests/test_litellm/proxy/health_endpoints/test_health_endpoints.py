@@ -778,3 +778,159 @@ def test_get_callback_identifier_custom_logger_registry_and_fallback():
     result = get_callback_identifier(my_callback_function)
     # Should fall back to callback_name() which returns __name__
     assert result == "my_callback_function"
+
+
+class TestConfigBaseForHealthCheck:
+    """A request that sets its own connection fields gets a base without the
+    configuration's credentials; anything it leaves unset still comes from
+    the configuration."""
+
+    CONFIG = {
+        "model": "openai/gpt-4o",
+        "api_key": "sk-configured",
+        "api_base": "https://configured.example/v1",
+        "vertex_credentials": "configured-creds",
+        "rpm": 100,
+    }
+
+    def _base(self, config, request, allow_client_side_credentials=False):
+        from litellm.proxy.health_endpoints._health_endpoints import (
+            _config_base_for_health_check,
+        )
+
+        return _config_base_for_health_check(
+            config, request, allow_client_side_credentials=allow_client_side_credentials
+        )
+
+    def test_request_without_connection_fields_inherits_config(self):
+        base = self._base(self.CONFIG, {"model": "openai/gpt-4o"})
+        assert base["api_key"] == "sk-configured"
+        assert base["api_base"] == "https://configured.example/v1"
+
+    def test_request_setting_api_base_does_not_inherit_config_credentials(self):
+        base = self._base(self.CONFIG, {"api_base": "https://caller.example/v1"})
+        assert "api_key" not in base
+        assert "api_base" not in base
+        assert "vertex_credentials" not in base
+        assert base["rpm"] == 100
+
+    def test_add_model_flow_keeps_its_own_credentials(self):
+        """Adding a second deployment for an already-configured name sends a
+        complete connection; it is tested as sent, not as configured."""
+        request = {
+            "model": "openai/gpt-4o",
+            "api_base": "https://new-deployment.example/v1",
+            "api_key": "sk-new-deployment",
+        }
+        merged = {**self._base(self.CONFIG, request), **request}
+        assert merged["api_base"] == "https://new-deployment.example/v1"
+        assert merged["api_key"] == "sk-new-deployment"
+        assert "sk-configured" not in str(merged)
+
+    def test_destination_override_without_own_key_inherits_no_credential(self):
+        """A request that redirects the destination but supplies no credential
+        of its own gets none from the configuration."""
+        request = {"api_base": "https://elsewhere.example"}
+        merged = {**self._base(self.CONFIG, request), **request}
+        assert "api_key" not in merged
+        assert "sk-configured" not in str(merged)
+
+    def test_non_api_base_destination_field_also_drops_credentials(self):
+        base = self._base(
+            {**self.CONFIG, "aws_secret_access_key": "configured-secret"},
+            {"aws_sts_endpoint": "https://caller.example"},
+        )
+        assert "api_key" not in base
+        assert "aws_secret_access_key" not in base
+
+    def test_opt_in_restores_configured_credentials_under_a_request_endpoint(self):
+        """With general_settings.allow_client_side_credentials enabled, a request
+        may pair its own endpoint with the configured credentials, as before."""
+        base = self._base(
+            self.CONFIG,
+            {"api_base": "https://caller.example/v1"},
+            allow_client_side_credentials=True,
+        )
+        assert base["api_key"] == "sk-configured"
+
+    def test_stored_credential_reference_is_dropped_with_the_credentials(self):
+        """A stored-credential name resolves to the same secrets downstream, so a
+        request that redirects the destination must not keep it either."""
+        config = {**self.CONFIG, "litellm_credential_name": "OpenAI-prod"}
+        base = self._base(config, {"api_base": "https://caller.example/v1"})
+        assert "litellm_credential_name" not in base
+        assert "api_key" not in base
+
+    def test_stored_credential_reference_kept_when_request_sets_no_connection(self):
+        """The Admin UI tests a configured model by naming it plus its stored
+        credential and nothing else; that keeps working."""
+        config = {**self.CONFIG, "litellm_credential_name": "OpenAI-prod"}
+        base = self._base(
+            config,
+            {
+                "model": "openai/gpt-4o",
+                "litellm_credential_name": "OpenAI-prod",
+                "custom_llm_provider": "openai",
+            },
+        )
+        assert base["litellm_credential_name"] == "OpenAI-prod"
+        assert base["api_key"] == "sk-configured"
+
+
+@pytest.mark.asyncio
+async def test_test_model_connection_does_not_send_config_key_to_request_api_base():
+    """
+    /health/test_connection must not pair a configured deployment's stored
+    credentials with a caller-supplied api_base: the configured key would be
+    sent to the caller's host.
+    """
+    mock_router = MagicMock()
+    mock_router.get_model_list.return_value = [
+        {
+            "model_name": "gpt-4o",
+            "litellm_params": {
+                "model": "azure/gpt-4o",
+                "api_key": "resolved-api-key-from-env",
+                "api_base": "https://resolved-endpoint.openai.azure.com/",
+                "api_version": "2024-10-21",
+            },
+            "model_info": {},
+        }
+    ]
+    mock_health_check_result = {"status": "healthy"}
+    mock_ahealth_check = AsyncMock(return_value=mock_health_check_result)
+    mock_run_with_timeout = AsyncMock(return_value=mock_health_check_result)
+
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", MagicMock()),
+        patch("litellm.proxy.proxy_server.llm_router", mock_router),
+        patch("litellm.proxy.proxy_server.premium_user", False),
+        patch("litellm.proxy.proxy_server.general_settings", {}),
+        patch(
+            "litellm.proxy.management_endpoints.model_management_endpoints.ModelManagementAuthChecks.can_user_make_model_call",
+            AsyncMock(),
+        ),
+        patch(
+            "litellm.proxy.health_endpoints._health_endpoints.litellm.ahealth_check",
+            mock_ahealth_check,
+        ),
+        patch(
+            "litellm.proxy.health_endpoints._health_endpoints.run_with_timeout",
+            mock_run_with_timeout,
+        ),
+    ):
+        await health_test_model_connection(
+            request=MagicMock(),
+            mode="chat",
+            litellm_params={
+                "model": "gpt-4o",
+                "api_base": "https://attacker.example/v1",
+            },
+            model_info={},
+            user_api_key_dict=MagicMock(),
+        )
+
+    model_params = mock_ahealth_check.call_args.kwargs["model_params"]
+    assert model_params["api_base"] == "https://attacker.example/v1"
+    assert "api_key" not in model_params
+    assert "resolved-api-key-from-env" not in str(model_params)

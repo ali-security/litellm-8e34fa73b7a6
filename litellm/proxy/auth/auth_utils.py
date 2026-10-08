@@ -2,14 +2,20 @@ import os
 import re
 import sys
 from functools import lru_cache
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple, Union
 
 from fastapi import HTTPException, Request, status
 
+import litellm
 from litellm import Router, provider_list
 from litellm._logging import verbose_proxy_logger
 from litellm.constants import STANDARD_CUSTOMER_ID_HEADERS
+from litellm.litellm_core_utils.url_utils import (
+    is_url_destination_allowed_by_host,
+    provider_url_destination_candidates,
+)
 from litellm.proxy._types import *
+from litellm.proxy.common_utils.http_parsing_utils import extract_nested_form_metadata
 from litellm.types.router import CONFIGURABLE_CLIENTSIDE_AUTH_PARAMS
 
 
@@ -142,6 +148,136 @@ def _allow_model_level_clientside_configurable_parameters(
     )
 
 
+# Metadata containers that carry per-request configuration. The same
+# banned-param list applies to them as to the request-body root, whether
+# they arrive as a dict, a JSON-encoded string, or multipart bracket
+# notation (``metadata[api_base]``).
+_NESTED_METADATA_KEYS: Tuple[str, ...] = ("metadata", "litellm_metadata")
+
+# Banned request-body params. One canonical list, applied to the request
+# body root and to every nested field the proxy forwards into the call
+# (metadata containers, fallback targets).
+_BANNED_REQUEST_BODY_PARAMS: Tuple[str, ...] = (
+    "api_base",
+    "base_url",
+    "user_config",
+    "aws_sts_endpoint",
+    "aws_web_identity_token",
+    "aws_role_name",
+    "vertex_credentials",
+    # SDK-only field; also rejected outright in is_request_body_safe.
+    "model_list",
+    "vertex_ai_credentials",
+)
+
+
+def _check_banned_params(
+    body: dict,
+    general_settings: dict,
+    llm_router: Optional[Router],
+    model: str,
+) -> None:
+    """Raise ``ValueError`` if ``body`` carries a banned param without admin opt-in.
+
+    Shared between the root-level check and the nested checks so a new
+    banned param only needs to be added in one place.
+    """
+    for param in _BANNED_REQUEST_BODY_PARAMS:
+        if (
+            param in body
+            and not check_complete_credentials(  # allow client-credentials to be passed to proxy
+                request_body=body
+            )
+        ):
+            if general_settings.get("allow_client_side_credentials") is True:
+                return
+            elif (
+                _allow_model_level_clientside_configurable_parameters(
+                    model=model,
+                    param=param,
+                    request_body_value=body[param],
+                    llm_router=llm_router,
+                )
+                is True
+            ):
+                return
+            raise ValueError(
+                f"Rejected Request: {param} is not allowed in request body. "
+                "Enable with `general_settings::allow_client_side_credentials` on proxy config.yaml. "
+                "Relevant Issue: https://huntr.com/bounties/4001e1a2-7b7a-4776-a3ae-e6692ec3d997",
+            )
+
+
+_FALLBACK_FIELDS: Tuple[str, ...] = (
+    "fallbacks",
+    "context_window_fallbacks",
+    "content_policy_fallbacks",
+)
+
+
+def _iter_fallback_field_values(request_body: Mapping[str, object]) -> Iterator[object]:
+    override = request_body.get("router_settings_override")
+    for source in (request_body, override):
+        if isinstance(source, Mapping):
+            for field in _FALLBACK_FIELDS:
+                yield source.get(field)
+
+
+def _iter_fallback_targets(
+    value: object, depth: int
+) -> Iterator[Union[str, Mapping[str, object]]]:
+    if depth > 2 * litellm.ROUTER_MAX_FALLBACKS:
+        raise ValueError(
+            "Rejected Request: fallback nesting exceeds the allowed validation depth."
+        )
+    if not isinstance(value, list):
+        return
+    for item in value:
+        if isinstance(item, str):
+            yield item
+        elif isinstance(item, Mapping):
+            values = tuple(item.values())
+            if not (values and all(isinstance(v, list) for v in values)):
+                yield item
+            if isinstance(item.get("model"), str):
+                for field in _FALLBACK_FIELDS:
+                    yield from _iter_fallback_targets(item.get(field), depth + 1)
+            else:
+                for target_list in values:
+                    yield from _iter_fallback_targets(target_list, depth + 1)
+
+
+def iter_request_fallback_targets(
+    request_body: Mapping[str, object],
+) -> Iterator[Union[str, Mapping[str, object]]]:
+    """Yield every fallback target a request body can route to.
+
+    Covers ``fallbacks`` / ``context_window_fallbacks`` /
+    ``content_policy_fallbacks`` at the top level and under
+    ``router_settings_override``, in both the flat (``["gpt-4", {...}]``) and
+    router-config (``[{"gpt-4": [...]}]``) shapes, including targets nested
+    inside other targets.
+    """
+    for value in _iter_fallback_field_values(request_body):
+        yield from _iter_fallback_targets(value, 0)
+
+
+def _reject_url_valued_fallback_target(value: str) -> None:
+    allowed_hosts = (
+        getattr(litellm, "provider_url_destination_allowed_hosts", []) or []
+    )
+    for candidate in provider_url_destination_candidates(value):
+        if not candidate.lower().startswith(("http://", "https://")):
+            continue
+        if is_url_destination_allowed_by_host(candidate, allowed_hosts):
+            continue
+        raise ValueError(
+            f"Rejected Request: URL-valued fallback destination '{value}' is not allowed. "
+            "Configure custom endpoints with api_base instead, or add the destination host to "
+            "`provider_url_destination_allowed_hosts` in litellm_settings."
+        )
+
+
 def is_request_body_safe(
     request_body: dict, general_settings: dict, llm_router: Optional[Router], model: str
 ) -> bool:
@@ -150,43 +286,75 @@ def is_request_body_safe(
 
     A malicious user can set the ﻿api_base to their own domain and invoke POST /chat/completions to intercept and steal the OpenAI API key.
     Relevant issue: https://huntr.com/bounties/4001e1a2-7b7a-4776-a3ae-e6692ec3d997
+
+    The banned-param check is applied to the request-body root and to the
+    nested fields the proxy forwards into the outbound call: metadata
+    containers (dict, JSON string, or multipart bracket notation),
+    ``litellm_params.metadata``, and every fallback target. ``model_list``
+    (SDK-only) is rejected outright.
     """
-    banned_params = [
-        "api_base",
-        "base_url",
-        "user_config",
-        "aws_sts_endpoint",
-        "aws_web_identity_token",
-        "aws_role_name",
-        "vertex_credentials",
-    ]
-
-    for param in banned_params:
-        if (
-            param in request_body
-            and not check_complete_credentials(  # allow client-credentials to be passed to proxy
-                request_body=request_body
-            )
+    if "model_list" in request_body:
+        raise ValueError(
+            "Rejected Request: model_list is not allowed in the request body."
+        )
+    _check_banned_params(request_body, general_settings, llm_router, model)
+    for metadata_key in _NESTED_METADATA_KEYS:
+        metadata = _coerce_metadata_to_dict(request_body.get(metadata_key))
+        if metadata is not None:
+            _check_banned_params(metadata, general_settings, llm_router, model)
+        if any(
+            isinstance(key, str) and key.startswith(f"{metadata_key}[")
+            for key in request_body
         ):
-            if general_settings.get("allow_client_side_credentials") is True:
-                return True
-            elif (
-                _allow_model_level_clientside_configurable_parameters(
-                    model=model,
-                    param=param,
-                    request_body_value=request_body[param],
-                    llm_router=llm_router,
-                )
-                is True
-            ):
-                return True
-            raise ValueError(
-                f"Rejected Request: {param} is not allowed in request body. "
-                "Enable with `general_settings::allow_client_side_credentials` on proxy config.yaml. "
-                "Relevant Issue: https://huntr.com/bounties/4001e1a2-7b7a-4776-a3ae-e6692ec3d997",
+            _check_banned_params(
+                extract_nested_form_metadata(
+                    form_data=request_body, prefix=f"{metadata_key}["
+                ),
+                general_settings,
+                llm_router,
+                model,
             )
-
+    for target in iter_request_fallback_targets(request_body):
+        if isinstance(target, dict):
+            _check_banned_params(target, general_settings, llm_router, model)
+            target_model = target.get("model")
+            if isinstance(target_model, str):
+                _reject_url_valued_fallback_target(target_model)
+        elif isinstance(target, str):
+            _reject_url_valued_fallback_target(target)
+    litellm_params = _coerce_metadata_to_dict(request_body.get("litellm_params"))
+    if litellm_params is not None:
+        litellm_params_metadata = _coerce_metadata_to_dict(
+            litellm_params.get("metadata")
+        )
+        if litellm_params_metadata is not None:
+            _check_banned_params(
+                litellm_params_metadata,
+                general_settings,
+                llm_router,
+                model,
+            )
     return True
+
+
+def _coerce_metadata_to_dict(value: Any) -> Optional[Dict[str, Any]]:
+    """Return ``value`` as a dict, parsing it from JSON if delivered as a string.
+
+    Multipart/form-data and ``extra_body`` callers send ``litellm_metadata``
+    as a JSON-encoded string; the proxy parses it into a dict later in
+    ``add_litellm_data_to_request``, but the auth-time bouncer runs first
+    and would otherwise miss the banned-param check on a still-stringified
+    metadata blob.
+    """
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        from litellm.litellm_core_utils.safe_json_loads import safe_json_loads
+
+        parsed = safe_json_loads(value)
+        if isinstance(parsed, dict):
+            return parsed
+    return None
 
 
 async def pre_db_read_auth_checks(

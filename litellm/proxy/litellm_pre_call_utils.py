@@ -5,7 +5,7 @@ import time
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 from starlette.datastructures import Headers
 
 import litellm
@@ -13,6 +13,10 @@ from litellm._logging import verbose_logger, verbose_proxy_logger
 from litellm._service_logger import ServiceLogging
 from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
 from litellm.litellm_core_utils.safe_json_loads import safe_json_loads
+from litellm.litellm_core_utils.url_utils import (
+    is_url_destination_allowed_by_host,
+    provider_url_destination_candidates,
+)
 from litellm.proxy._types import (
     AddTeamCallback,
     CommonProxyErrors,
@@ -122,6 +126,59 @@ def _get_metadata_variable_name(request: Request) -> str:
         return "litellm_metadata"
 
     return "metadata"
+
+
+# Request fields whose value, when URL-valued, becomes the outbound destination
+# for a provider call. Letting a proxy caller pin the destination is an SSRF
+# primitive (HuggingFace/Oobabooga `model`, Gemini files `file_id`); guard
+# them centrally so SDK users keep working but proxy users default-deny.
+_URL_DESTINATION_REQUEST_FIELDS = ("model", "file_id")
+
+
+def _reject_url_valued_destinations(data: Dict[str, Any]) -> None:
+    """Reject URL-valued ``model``/``file_id`` unless admin-allowlisted.
+
+    Some providers (HuggingFace, Oobabooga, Gemini files) accept a URL in the
+    identifier field and use it as the outbound destination. On the proxy that
+    is an SSRF primitive — a low-privilege caller can point traffic at any
+    host the proxy can reach, including internal services. Reject here at the
+    proxy boundary so SDK users (who legitimately pass URL-valued identifiers)
+    are unaffected, while admins can opt specific hosts back in via
+    ``litellm.provider_url_destination_allowed_hosts``.
+    """
+    for field in _URL_DESTINATION_REQUEST_FIELDS:
+        value = data.get(field)
+        if isinstance(value, str):
+            reject_url_valued_destination(field, value)
+
+
+def reject_url_valued_destination(field: str, value: str) -> None:
+    """Reject a URL-valued destination identifier unless admin-allowlisted.
+
+    Operates on one field/value pair. ``_reject_url_valued_destinations`` applies
+    it across ``_URL_DESTINATION_REQUEST_FIELDS`` for a request body.
+    """
+    allowed_hosts = (
+        getattr(litellm, "provider_url_destination_allowed_hosts", []) or []
+    )
+    for candidate in provider_url_destination_candidates(value):
+        if not candidate.lower().startswith(("http://", "https://")):
+            continue
+        if is_url_destination_allowed_by_host(candidate, allowed_hosts):
+            continue
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "invalid_request",
+                "param": field,
+                "message": (
+                    f"URL-valued '{field}' is not allowed. Configure custom "
+                    "endpoints with api_base instead, or add the destination "
+                    "host to `provider_url_destination_allowed_hosts` in "
+                    "litellm_settings."
+                ),
+            },
+        )
 
 
 def _extract_generic_session_id_from_headers(
@@ -968,6 +1025,7 @@ async def add_litellm_data_to_request(  # noqa: PLR0915
         "secret_fields",
     ):
         data.pop(_internal_key, None)
+    _reject_url_valued_destinations(data)
     # Strip spoofable auth metadata from user-supplied metadata dict
     _user_metadata = data.get("metadata")
     if isinstance(_user_metadata, dict):
